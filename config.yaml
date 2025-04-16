@@ -14,7 +14,7 @@ swap:
   maxAmount: 0.2  # Maximum amount of TEA to swap
 
 # Timing settings
-timeBetweenSwaps: 25  # Hours between batches
+timeBetweenSwaps: 25  # Hours between swap cycles
 
-# Number of swaps per batch
-maxSwapsPerBatch: 110  # Number of swaps to perform in each batch
+# Number of swaps per wallet
+swapsPerWallet: 2  # Number of swaps to perform for each wallet
