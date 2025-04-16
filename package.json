@@ -1,0 +1,19 @@
+{
+    "name": "t3a-sepolia-auto-swap",
+    "version": "1.0.0",
+    "description": "Automated token swap script for T3a Sepolia network with random amounts and tokens",
+    "main": "index.js",
+    "scripts": {
+      "start": "node index.js"
+    },
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+      "ethers": "^5.7.2",
+      "js-yaml": "^4.1.0",
+      "winston": "^3.8.2"
+    },
+    "engines": {
+      "node": ">=14.0.0"
+    }
+  }
