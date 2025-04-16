@@ -1,0 +1,20 @@
+# Tea Sepolia Auto Swap Configuration
+
+# Transaction settings
+transaction:
+  slippage: 0.5  # 0.5% slippage tolerance
+  gasPriceMultiplier: 1.1  # Add 10% to current gas price
+  timeoutMinutes: 20
+  maxRetries: 3
+  retryDelay: 5000  # 5 seconds between retries
+
+# Swap settings
+swap:
+  minAmount: 0.1  # Minimum amount of TEA to swap
+  maxAmount: 0.2  # Maximum amount of TEA to swap
+
+# Timing settings
+timeBetweenSwaps: 25  # Hours between batches
+
+# Number of swaps per batch
+maxSwapsPerBatch: 110  # Number of swaps to perform in each batch
