@@ -262,6 +262,8 @@ class SwapManager {
     // Rotate to next wallet for next swap
     this.currentKeyIndex = (this.currentKeyIndex + 1) % this.privateKeys.length;
     
+    logger.info(`Using wallet ${this.currentKeyIndex === 0 ? this.privateKeys.length : this.currentKeyIndex}/${this.privateKeys.length}, address: ${wallet.address.substring(0, 10)}...`);
+    
     return wallet;
   }
 
@@ -335,24 +337,24 @@ class SwapManager {
   }
 
   /**
-   * Swap exact ETH for tokens
-   * @param {string} tokenAddress Destination token address
+   * Perform a swap with a specific wallet
+   * @param {ethers.Wallet} wallet Wallet to use for the swap
+   * @param {string} tokenAddress Token to swap to
    * @param {string} amountInEth Amount of ETH to swap
-   * @param {number} swapIndex Current swap index in batch
+   * @param {number} swapIndex Current swap index
    * @returns {Promise<boolean>} Success status
    */
-  async swapETHForToken(tokenAddress, amountInEth, swapIndex) {
+  async performSwap(wallet, tokenAddress, amountInEth, swapIndex) {
     const tokenInfo = await this.getTokenInfo(tokenAddress);
     const amountIn = ethers.utils.parseEther(amountInEth);
-    const wallet = this.getCurrentWallet();
     
-    logger.info(`Starting swap ${swapIndex}/${this.config.maxSwapsPerBatch}: ${amountInEth} TEA → ${tokenInfo.symbol} (${tokenInfo.name}) using wallet ${wallet.address.substring(0, 10)}...`);
+    logger.info(`Starting swap ${swapIndex}: ${amountInEth} TEA → ${tokenInfo.symbol} (${tokenInfo.name}) using wallet ${wallet.address}`);
     
     try {
       // Check wallet balance
       const balance = await this.provider.getBalance(wallet.address);
       if (balance.lt(amountIn)) {
-        logger.error(`Insufficient balance: Required ${amountInEth} TEA, have ${ethers.utils.formatEther(balance)} TEA for wallet ${wallet.address.substring(0, 10)}`);
+        logger.error(`Insufficient balance: Required ${amountInEth} TEA, have ${ethers.utils.formatEther(balance)} TEA for wallet ${wallet.address}`);
         return false;
       }
       
@@ -449,7 +451,7 @@ class SwapManager {
       
       return success;
     } catch (error) {
-      logger.error(`Error in swapETHForToken: ${error.message}`);
+      logger.error(`Error in performSwap: ${error.message}`);
       return false;
     }
   }
@@ -479,76 +481,91 @@ class SwapManager {
   }
   
   /**
-   * Execute a batch of swaps
-   * @returns {Promise<number>} Number of successful swaps
+   * Execute swaps for all wallets
+   * @returns {Promise<number>} Total number of successful swaps
    */
-  async executeBatchSwaps() {
-    let successfulSwaps = 0;
+  async executeSwapsForAllWallets() {
+    let totalSuccessfulSwaps = 0;
     
-    for (let i = 0; i < this.config.maxSwapsPerBatch; i++) {
-      try {
-        // Generate random amount for this swap
-        const randomAmount = generateRandomAmount(
-          this.config.swap.minAmount, 
-          this.config.swap.maxAmount
-        );
-        
-        // Select random token
-        const randomToken = selectRandomToken();
-        
-        logger.info(`Swap ${i + 1}/${this.config.maxSwapsPerBatch} in current batch initiated`);
-        logger.info(`Random amount: ${randomAmount} TEA, Token: ${randomToken.symbol}`);
-        
-        // Execute the swap
-        const success = await this.swapETHForToken(randomToken.address, randomAmount, i + 1);
-        
-        if (success) {
-          successfulSwaps++;
-        } else {
-          logger.error(`Swap ${i + 1} in batch failed. Continuing with next swap...`);
-          // Add a short delay before trying the next swap
-          await new Promise(resolve => setTimeout(resolve, 30 * 1000)); // 30 second delay
+    // For each wallet in pk.txt
+    for (let walletIndex = 0; walletIndex < this.privateKeys.length; walletIndex++) {
+      // Get the wallet
+      const wallet = new ethers.Wallet(this.privateKeys[walletIndex], this.provider);
+      logger.info(`Processing wallet ${walletIndex + 1}/${this.privateKeys.length}: ${wallet.address}`);
+      
+      // Perform configured number of swaps with this wallet
+      for (let swapIndex = 0; swapIndex < this.config.swapsPerWallet; swapIndex++) {
+        try {
+          // Generate random amount for this swap
+          const randomAmount = generateRandomAmount(
+            this.config.swap.minAmount, 
+            this.config.swap.maxAmount
+          );
+          
+          // Select random token
+          const randomToken = selectRandomToken();
+          
+          logger.info(`Wallet ${walletIndex + 1}, Swap ${swapIndex + 1}/${this.config.swapsPerWallet} initiated`);
+          logger.info(`Random amount: ${randomAmount} TEA, Token: ${randomToken.symbol}`);
+          
+          // Execute the swap with this specific wallet
+          const success = await this.performSwap(wallet, randomToken.address, randomAmount, swapIndex + 1);
+          
+          if (success) {
+            totalSuccessfulSwaps++;
+          } else {
+            logger.error(`Swap failed for wallet ${wallet.address}. Continuing with next swap...`);
+            // Add a short delay before trying the next swap
+            await new Promise(resolve => setTimeout(resolve, 30 * 1000)); // 30 second delay
+          }
+          
+          // Add a short delay between swaps for the same wallet
+          if (swapIndex < this.config.swapsPerWallet - 1) {
+            const betweenSwapsDelay = generateRandomDelay(3, 10); // 3-10 seconds
+            logger.info(`Waiting ${betweenSwapsDelay/1000} seconds before next swap...`);
+            await new Promise(resolve => setTimeout(resolve, betweenSwapsDelay));
+          }
+        } catch (error) {
+          logger.error(`Error processing swap for wallet ${wallet.address}: ${error.message}`);
         }
-        
-        // Add a short delay between swaps in the same batch
-        if (i < this.config.maxSwapsPerBatch - 1) {
-          const betweenSwapsDelay = generateRandomDelay(3, 10); // 3-10 seconds
-          logger.info(`Waiting ${betweenSwapsDelay/1000} seconds before next swap in batch...`);
-          await new Promise(resolve => setTimeout(resolve, betweenSwapsDelay));
-        }
-      } catch (error) {
-        logger.error(`Error processing swap ${i + 1} in batch: ${error.message}`);
+      }
+      
+      // Add delay between processing different wallets
+      if (walletIndex < this.privateKeys.length - 1) {
+        const betweenWalletsDelay = generateRandomDelay(10, 30); // 10-30 seconds
+        logger.info(`All swaps completed for wallet ${wallet.address}. Waiting ${betweenWalletsDelay/1000} seconds before processing next wallet...`);
+        await new Promise(resolve => setTimeout(resolve, betweenWalletsDelay));
       }
     }
     
-    return successfulSwaps;
+    return totalSuccessfulSwaps;
   }
   
   /**
-   * Start the swap loop with batches
+   * Start the swap loop
    */
   async startSwapLoop() {
     logger.info('Starting the automated swap process...');
     
-    // Run forever, in batches with delays between batches
+    // Run forever, processing all wallets then waiting for next cycle
     while (true) {
       try {
-        logger.info(`Starting a new batch of swaps (max ${this.config.maxSwapsPerBatch} swaps)`);
+        logger.info(`Starting a new cycle for all wallets`);
         
-        // Execute a batch of swaps
-        const successfulSwaps = await this.executeBatchSwaps();
+        // Execute swaps for all wallets
+        const totalSuccessfulSwaps = await this.executeSwapsForAllWallets();
         
-        logger.info(`Batch completed with ${successfulSwaps}/${this.config.maxSwapsPerBatch} successful swaps`);
+        logger.info(`Cycle completed with ${totalSuccessfulSwaps} successful swaps across all wallets`);
         
-        // Start countdown for next batch
-        const nextBatchTime = new Date(Date.now() + this.countdownDuration);
-        logger.info(`Next batch will occur in ${this.config.timeBetweenSwaps} hours (${nextBatchTime.toLocaleString()})`);
+        // Start countdown for next cycle
+        const nextCycleTime = new Date(Date.now() + this.countdownDuration);
+        logger.info(`Next cycle will occur in ${this.config.timeBetweenSwaps} hours (${nextCycleTime.toLocaleString()})`);
         
-        // Wait for the configured time between batches
+        // Wait for the configured time between cycles
         await new Promise(resolve => setTimeout(resolve, this.countdownDuration));
       } catch (error) {
-        logger.error(`Error in batch execution: ${error.message}`);
-        // If there's an error in the batch execution, wait a bit before starting the next batch
+        logger.error(`Error in cycle execution: ${error.message}`);
+        // If there's an error in the cycle execution, wait a bit before starting the next cycle
         await new Promise(resolve => setTimeout(resolve, 10 * 60 * 1000)); // 10 minutes
       }
     }
