@@ -3,6 +3,7 @@ const path = require('path');
 const ethers = require('ethers');
 const yaml = require('js-yaml');
 const winston = require('winston');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 // Network constants - hardcoded instead of in config
 const NETWORK = {
@@ -30,21 +31,26 @@ const ERC20_ABI = [
 ];
 
 // Setup logger
-const logger = winston.createLogger({
-  format: winston.format.combine(
-    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    winston.format.printf(({ timestamp, level, message }) => {
-      return `[${timestamp}] ${message}`;
-    })
-  ),
-  transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({ 
-      filename: `logs/swap_${new Date().toISOString().split('T')[0]}.log`,
-      dirname: 'logs' 
-    })
-  ]
-});
+const createLogger = (threadId = 'main') => {
+  return winston.createLogger({
+    format: winston.format.combine(
+      winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+      winston.format.printf(({ timestamp, level, message }) => {
+        return `[${timestamp}] ${message}`;
+      })
+    ),
+    transports: [
+      new winston.transports.Console(),
+      new winston.transports.File({ 
+        filename: `logs/swap_${new Date().toISOString().split('T')[0]}_thread_${threadId}.log`,
+        dirname: 'logs' 
+      })
+    ]
+  });
+};
+
+// Create main logger
+const logger = createLogger();
 
 // Ensure log directory exists
 if (!fs.existsSync('logs')) {
@@ -234,9 +240,12 @@ function loadPrivateKeys() {
  * SwapManager class - Handles all swap operations
  */
 class SwapManager {
-  constructor() {
+  constructor(threadId = 'main', walletIndices = []) {
+    this.threadId = threadId;
+    this.walletIndices = walletIndices;
     this.config = loadConfig();
     this.privateKeys = loadPrivateKeys();
+    this.filteredKeys = walletIndices.map(index => this.privateKeys[index]);
     this.currentKeyIndex = 0;
     this.provider = new ethers.providers.JsonRpcProvider(NETWORK.rpcUrl);
     this.router = new ethers.Contract(
@@ -245,9 +254,13 @@ class SwapManager {
       this.provider
     );
     
-    logger.info(`SwapManager initialized with ${this.privateKeys.length} wallet(s)`);
+    // Create thread-specific logger
+    this.logger = createLogger(threadId);
     
-    // Calculate countdown duration in milliseconds (25 hours)
+    this.logger.info(`SwapManager initialized with ${this.filteredKeys.length} wallet(s) on thread ${threadId}`);
+    this.logger.info(`Managing wallets with indices: ${walletIndices.join(', ')}`);
+    
+    // Calculate countdown duration in milliseconds
     this.countdownDuration = this.config.timeBetweenSwaps * 60 * 60 * 1000;
   }
 
@@ -256,15 +269,16 @@ class SwapManager {
    * @returns {Object} Current wallet and signer
    */
   getCurrentWallet() {
-    const privateKey = this.privateKeys[this.currentKeyIndex];
+    const privateKey = this.filteredKeys[this.currentKeyIndex];
+    const walletIndex = this.walletIndices[this.currentKeyIndex];
     const wallet = new ethers.Wallet(privateKey, this.provider);
     
     // Rotate to next wallet for next swap
-    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.privateKeys.length;
+    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.filteredKeys.length;
     
-    logger.info(`Using wallet ${this.currentKeyIndex === 0 ? this.privateKeys.length : this.currentKeyIndex}/${this.privateKeys.length}, address: ${wallet.address.substring(0, 10)}...`);
+    this.logger.info(`[Wallet ${walletIndex}] Using wallet ${this.currentKeyIndex === 0 ? this.filteredKeys.length : this.currentKeyIndex}/${this.filteredKeys.length}, address: ${wallet.address.substring(0, 10)}...`);
     
-    return wallet;
+    return { wallet, walletIndex };
   }
 
   /**
@@ -291,7 +305,7 @@ class SwapManager {
       
       return { symbol, name, decimals, address: tokenAddress };
     } catch (error) {
-      logger.error(`Error getting token info for ${tokenAddress}: ${error.message}`);
+      this.logger.error(`Error getting token info for ${tokenAddress}: ${error.message}`);
       throw error;
     }
   }
@@ -301,21 +315,22 @@ class SwapManager {
    * @param {string} tokenAddress Token address
    * @param {ethers.BigNumber} amount Amount to approve
    * @param {ethers.Wallet} wallet Wallet to use for approval
+   * @param {number} walletIndex Index of the wallet
    * @returns {Promise<void>}
    */
-  async checkAllowance(tokenAddress, amount, wallet) {
+  async checkAllowance(tokenAddress, amount, wallet, walletIndex) {
     const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
     const allowance = await tokenContract.allowance(wallet.address, NETWORK.routerAddress);
     
     if (allowance.lt(amount)) {
-      logger.info(`Approving router to spend ${tokenAddress} for wallet ${wallet.address.substring(0, 10)}...`);
+      this.logger.info(`[Wallet ${walletIndex}] Approving router to spend ${tokenAddress} for wallet ${wallet.address.substring(0, 10)}...`);
       const tokenWithSigner = tokenContract.connect(wallet);
       const tx = await tokenWithSigner.approve(
         NETWORK.routerAddress,
         ethers.constants.MaxUint256 // Approve max amount
       );
       await tx.wait();
-      logger.info(`Approval transaction confirmed: ${tx.hash}`);
+      this.logger.info(`[Wallet ${walletIndex}] Approval transaction confirmed: ${tx.hash}`);
     }
   }
 
@@ -330,7 +345,7 @@ class SwapManager {
       const multiplier = Math.floor(this.config.transaction.gasPriceMultiplier * 100);
       return gasPrice.mul(multiplier).div(100);
     } catch (error) {
-      logger.error(`Error getting gas price: ${error.message}`);
+      this.logger.error(`Error getting gas price: ${error.message}`);
       // Fallback gas price - 5 Gwei
       return ethers.utils.parseUnits('5', 'gwei');
     }
@@ -339,22 +354,23 @@ class SwapManager {
   /**
    * Perform a swap with a specific wallet
    * @param {ethers.Wallet} wallet Wallet to use for the swap
+   * @param {number} walletIndex Index of the wallet
    * @param {string} tokenAddress Token to swap to
    * @param {string} amountInEth Amount of ETH to swap
    * @param {number} swapIndex Current swap index
    * @returns {Promise<boolean>} Success status
    */
-  async performSwap(wallet, tokenAddress, amountInEth, swapIndex) {
+  async performSwap(wallet, walletIndex, tokenAddress, amountInEth, swapIndex) {
     const tokenInfo = await this.getTokenInfo(tokenAddress);
     const amountIn = ethers.utils.parseEther(amountInEth);
     
-    logger.info(`Starting swap ${swapIndex}: ${amountInEth} TEA → ${tokenInfo.symbol} (${tokenInfo.name}) using wallet ${wallet.address}`);
+    this.logger.info(`[Wallet ${walletIndex}] Starting swap ${swapIndex}: ${amountInEth} TEA → ${tokenInfo.symbol} (${tokenInfo.name}) using wallet ${wallet.address}`);
     
     try {
       // Check wallet balance
       const balance = await this.provider.getBalance(wallet.address);
       if (balance.lt(amountIn)) {
-        logger.error(`Insufficient balance: Required ${amountInEth} TEA, have ${ethers.utils.formatEther(balance)} TEA for wallet ${wallet.address}`);
+        this.logger.error(`[Wallet ${walletIndex}] Insufficient balance: Required ${amountInEth} TEA, have ${ethers.utils.formatEther(balance)} TEA for wallet ${wallet.address}`);
         return false;
       }
       
@@ -365,8 +381,8 @@ class SwapManager {
       const slippage = this.config.transaction.slippage;
       const minOutput = expectedOutput.mul(1000 - Math.floor(slippage * 10)).div(1000);
       
-      logger.info(`Expected output: ${ethers.utils.formatUnits(expectedOutput, tokenInfo.decimals)} ${tokenInfo.symbol}`);
-      logger.info(`Minimum output (${slippage}% slippage): ${ethers.utils.formatUnits(minOutput, tokenInfo.decimals)} ${tokenInfo.symbol}`);
+      this.logger.info(`[Wallet ${walletIndex}] Expected output: ${ethers.utils.formatUnits(expectedOutput, tokenInfo.decimals)} ${tokenInfo.symbol}`);
+      this.logger.info(`[Wallet ${walletIndex}] Minimum output (${slippage}% slippage): ${ethers.utils.formatUnits(minOutput, tokenInfo.decimals)} ${tokenInfo.symbol}`);
       
       // Prepare transaction parameters
       const deadline = Math.floor(Date.now() / 1000) + (60 * this.config.transaction.timeoutMinutes);
@@ -380,7 +396,7 @@ class SwapManager {
       while (attempt < this.config.transaction.maxRetries && !success) {
         try {
           if (attempt > 0) {
-            logger.info(`Retry attempt ${attempt + 1}/${this.config.transaction.maxRetries}...`);
+            this.logger.info(`[Wallet ${walletIndex}] Retry attempt ${attempt + 1}/${this.config.transaction.maxRetries}...`);
           }
           
           const routerWithSigner = this.router.connect(wallet);
@@ -403,18 +419,15 @@ class SwapManager {
             
             // Add 20% buffer to estimated gas
             txObject.gasLimit = estimatedGas.mul(120).div(100);
-            logger.info(`Estimated gas: ${estimatedGas.toString()}, with buffer: ${txObject.gasLimit.toString()}`);
+            this.logger.info(`[Wallet ${walletIndex}] Estimated gas: ${estimatedGas.toString()}, with buffer: ${txObject.gasLimit.toString()}`);
           } catch (gasEstimationError) {
-            logger.error(`Gas estimation failed: ${gasEstimationError.message}`);
+            this.logger.error(`[Wallet ${walletIndex}] Gas estimation failed: ${gasEstimationError.message}`);
             // Fallback to a safe gas limit if estimation fails
             txObject.gasLimit = 300000;
-            logger.info(`Using fallback gas limit: ${txObject.gasLimit}`);
+            this.logger.info(`[Wallet ${walletIndex}] Using fallback gas limit: ${txObject.gasLimit}`);
           }
           
-          // Random delay before sending transaction (2-5 seconds)
-          const delayMs = generateRandomDelay(2, 5);
-          logger.info(`Adding random delay of ${delayMs/1000} seconds before sending transaction...`);
-          await new Promise(resolve => setTimeout(resolve, delayMs));
+          // No delay before sending transaction
           
           const tx = await routerWithSigner.swapExactETHForTokens(
             minOutput,
@@ -424,18 +437,18 @@ class SwapManager {
             txObject
           );
           
-          logger.info(`Transaction submitted: ${tx.hash}`);
+          this.logger.info(`[Wallet ${walletIndex}] Transaction submitted: ${tx.hash}`);
           const receipt = await tx.wait();
           
-          logger.info(`Swap successful! Transaction confirmed in block ${receipt.blockNumber}`);
+          this.logger.info(`[Wallet ${walletIndex}] Swap successful! Transaction confirmed in block ${receipt.blockNumber}`);
           success = true;
           
           // Log updated balances
-          await this.logBalances(tokenAddress, tokenInfo, wallet);
+          await this.logBalances(tokenAddress, tokenInfo, wallet, walletIndex);
         } catch (error) {
           lastError = error;
           const errorMessage = error.reason || error.message || 'Unknown error';
-          logger.error(`Swap attempt ${attempt + 1} failed: ${errorMessage}`);
+          this.logger.error(`[Wallet ${walletIndex}] Swap attempt ${attempt + 1} failed: ${errorMessage}`);
           attempt++;
           
           if (attempt < this.config.transaction.maxRetries) {
@@ -446,12 +459,12 @@ class SwapManager {
       }
       
       if (!success) {
-        logger.error(`All swap attempts failed after ${this.config.transaction.maxRetries} retries.`);
+        this.logger.error(`[Wallet ${walletIndex}] All swap attempts failed after ${this.config.transaction.maxRetries} retries.`);
       }
       
       return success;
     } catch (error) {
-      logger.error(`Error in performSwap: ${error.message}`);
+      this.logger.error(`[Wallet ${walletIndex}] Error in performSwap: ${error.message}`);
       return false;
     }
   }
@@ -461,9 +474,10 @@ class SwapManager {
    * @param {string} tokenAddress Token address to check balance
    * @param {Object} tokenInfo Token information
    * @param {ethers.Wallet} wallet Wallet to check balances for
+   * @param {number} walletIndex Index of the wallet
    * @returns {Promise<void>}
    */
-  async logBalances(tokenAddress, tokenInfo, wallet) {
+  async logBalances(tokenAddress, tokenInfo, wallet, walletIndex) {
     try {
       const ethBalance = await this.provider.getBalance(wallet.address);
       const formattedEthBalance = ethers.utils.formatEther(ethBalance);
@@ -472,26 +486,27 @@ class SwapManager {
       const tokenBalance = await tokenContract.balanceOf(wallet.address);
       const formattedTokenBalance = ethers.utils.formatUnits(tokenBalance, tokenInfo.decimals);
       
-      logger.info(`Current balances for wallet ${wallet.address.substring(0, 10)}...:`);
-      logger.info(`- TEA: ${formattedEthBalance}`);
-      logger.info(`- ${tokenInfo.symbol}: ${formattedTokenBalance}`);
+      this.logger.info(`[Wallet ${walletIndex}] Current balances for wallet ${wallet.address.substring(0, 10)}...:`);
+      this.logger.info(`[Wallet ${walletIndex}] - TEA: ${formattedEthBalance}`);
+      this.logger.info(`[Wallet ${walletIndex}] - ${tokenInfo.symbol}: ${formattedTokenBalance}`);
     } catch (error) {
-      logger.error(`Error getting balances: ${error.message}`);
+      this.logger.error(`[Wallet ${walletIndex}] Error getting balances: ${error.message}`);
     }
   }
   
   /**
-   * Execute swaps for all wallets
+   * Execute swaps for assigned wallets in this thread
    * @returns {Promise<number>} Total number of successful swaps
    */
-  async executeSwapsForAllWallets() {
+  async executeSwapsForAssignedWallets() {
     let totalSuccessfulSwaps = 0;
     
-    // For each wallet in pk.txt
-    for (let walletIndex = 0; walletIndex < this.privateKeys.length; walletIndex++) {
-      // Get the wallet
+    // For each wallet assigned to this thread
+    for (let i = 0; i < this.walletIndices.length; i++) {
+      const walletIndex = this.walletIndices[i];
       const wallet = new ethers.Wallet(this.privateKeys[walletIndex], this.provider);
-      logger.info(`Processing wallet ${walletIndex + 1}/${this.privateKeys.length}: ${wallet.address}`);
+      
+      this.logger.info(`[Wallet ${walletIndex}] Processing wallet ${i + 1}/${this.walletIndices.length}: ${wallet.address}`);
       
       // Perform configured number of swaps with this wallet
       for (let swapIndex = 0; swapIndex < this.config.swapsPerWallet; swapIndex++) {
@@ -505,16 +520,16 @@ class SwapManager {
           // Select random token
           const randomToken = selectRandomToken();
           
-          logger.info(`Wallet ${walletIndex + 1}, Swap ${swapIndex + 1}/${this.config.swapsPerWallet} initiated`);
-          logger.info(`Random amount: ${randomAmount} TEA, Token: ${randomToken.symbol}`);
+          this.logger.info(`[Wallet ${walletIndex}] Swap ${swapIndex + 1}/${this.config.swapsPerWallet} initiated`);
+          this.logger.info(`[Wallet ${walletIndex}] Random amount: ${randomAmount} TEA, Token: ${randomToken.symbol}`);
           
           // Execute the swap with this specific wallet
-          const success = await this.performSwap(wallet, randomToken.address, randomAmount, swapIndex + 1);
+          const success = await this.performSwap(wallet, walletIndex, randomToken.address, randomAmount, swapIndex + 1);
           
           if (success) {
             totalSuccessfulSwaps++;
           } else {
-            logger.error(`Swap failed for wallet ${wallet.address}. Continuing with next swap...`);
+            this.logger.error(`[Wallet ${walletIndex}] Swap failed for wallet ${wallet.address}. Continuing with next swap...`);
             // Add a short delay before trying the next swap
             await new Promise(resolve => setTimeout(resolve, 30 * 1000)); // 30 second delay
           }
@@ -522,18 +537,18 @@ class SwapManager {
           // Add a short delay between swaps for the same wallet
           if (swapIndex < this.config.swapsPerWallet - 1) {
             const betweenSwapsDelay = generateRandomDelay(3, 10); // 3-10 seconds
-            logger.info(`Waiting ${betweenSwapsDelay/1000} seconds before next swap...`);
+            this.logger.info(`[Wallet ${walletIndex}] Waiting ${betweenSwapsDelay/1000} seconds before next swap...`);
             await new Promise(resolve => setTimeout(resolve, betweenSwapsDelay));
           }
         } catch (error) {
-          logger.error(`Error processing swap for wallet ${wallet.address}: ${error.message}`);
+          this.logger.error(`[Wallet ${walletIndex}] Error processing swap for wallet ${wallet.address}: ${error.message}`);
         }
       }
       
       // Add delay between processing different wallets
-      if (walletIndex < this.privateKeys.length - 1) {
+      if (i < this.walletIndices.length - 1) {
         const betweenWalletsDelay = generateRandomDelay(10, 30); // 10-30 seconds
-        logger.info(`All swaps completed for wallet ${wallet.address}. Waiting ${betweenWalletsDelay/1000} seconds before processing next wallet...`);
+        this.logger.info(`[Wallet ${walletIndex}] All swaps completed for wallet ${wallet.address}. Waiting ${betweenWalletsDelay/1000} seconds before processing next wallet...`);
         await new Promise(resolve => setTimeout(resolve, betweenWalletsDelay));
       }
     }
@@ -542,29 +557,29 @@ class SwapManager {
   }
   
   /**
-   * Start the swap loop
+   * Start the swap loop for this thread
    */
   async startSwapLoop() {
-    logger.info('Starting the automated swap process...');
+    this.logger.info(`Starting the automated swap process...`);
     
-    // Run forever, processing all wallets then waiting for next cycle
+    // Run forever, processing assigned wallets then waiting for next cycle
     while (true) {
       try {
-        logger.info(`Starting a new cycle for all wallets`);
+        this.logger.info(`Starting a new cycle for assigned wallets`);
         
         // Execute swaps for all wallets
-        const totalSuccessfulSwaps = await this.executeSwapsForAllWallets();
+        const totalSuccessfulSwaps = await this.executeSwapsForAssignedWallets();
         
-        logger.info(`Cycle completed with ${totalSuccessfulSwaps} successful swaps across all wallets`);
+        this.logger.info(`Cycle completed with ${totalSuccessfulSwaps} successful swaps`);
         
         // Start countdown for next cycle
         const nextCycleTime = new Date(Date.now() + this.countdownDuration);
-        logger.info(`Next cycle will occur in ${this.config.timeBetweenSwaps} hours (${nextCycleTime.toLocaleString()})`);
+        this.logger.info(`Next cycle will occur in ${this.config.timeBetweenSwaps} hours (${nextCycleTime.toLocaleString()})`);
         
         // Wait for the configured time between cycles
         await new Promise(resolve => setTimeout(resolve, this.countdownDuration));
       } catch (error) {
-        logger.error(`Error in cycle execution: ${error.message}`);
+        this.logger.error(`Error in cycle execution: ${error.message}`);
         // If there's an error in the cycle execution, wait a bit before starting the next cycle
         await new Promise(resolve => setTimeout(resolve, 10 * 60 * 1000)); // 10 minutes
       }
@@ -573,18 +588,108 @@ class SwapManager {
 }
 
 /**
- * Main function to start the application
+ * Worker thread function - handles individual wallets
+ */
+if (!isMainThread) {
+  const { threadId, walletIndices } = workerData;
+  
+  // Create worker-specific logger
+  const workerLogger = createLogger(threadId);
+  workerLogger.info(`Starting with wallets: ${walletIndices.join(', ')}`);
+  
+  // Create a SwapManager for the subset of wallets assigned to this thread
+  const swapManager = new SwapManager(threadId, walletIndices);
+  
+  // Start the swap loop for this thread
+  swapManager.startSwapLoop()
+    .catch(error => {
+      workerLogger.error(`Fatal error: ${error.message}`);
+      process.exit(1);
+    });
+}
+
+/**
+ * Main function to start the application and distribute wallets to threads
  */
 async function main() {
-  logger.info('Initializing Auto Swap Script for Tea Sepolia');
+  if (!isMainThread) return; // Only run in the main thread
+  
+  logger.info('Initializing Auto Swap Script for Tea Sepolia with threading support');
   
   try {
-    const swapManager = new SwapManager();
-    await swapManager.startSwapLoop();
+    const config = loadConfig();
+    const privateKeys = loadPrivateKeys();
+    const numWallets = privateKeys.length;
+    
+    // Default to 1 thread if not specified in config
+    const numThreads = config.threads || 1;
+    
+    logger.info(`Configuration loaded: ${numWallets} wallets, ${numThreads} threads`);
+    
+    if (numThreads <= 1) {
+      // Single-threaded mode
+      logger.info('Running in single-threaded mode');
+      const walletIndices = Array.from({ length: numWallets }, (_, i) => i);
+      const swapManager = new SwapManager('main', walletIndices);
+      await swapManager.startSwapLoop();
+    } else {
+      // Multi-threaded mode
+      logger.info(`Running in multi-threaded mode with ${numThreads} threads`);
+      
+      // Distribute wallets among threads as evenly as possible
+      const walletIndices = Array.from({ length: numWallets }, (_, i) => i);
+      const walletDistribution = distributeWallets(walletIndices, numThreads);
+      
+      // Start worker threads
+      for (let i = 0; i < numThreads; i++) {
+        const threadId = `thread-${i + 1}`;
+        const threadWallets = walletDistribution[i];
+        
+        logger.info(`Starting with wallets: ${threadWallets.join(', ')}`);
+        
+        // Create and start worker thread
+        const worker = new Worker(__filename, {
+          workerData: {
+            threadId,
+            walletIndices: threadWallets
+          }
+        });
+        
+        // Handle worker messages and errors
+        worker.on('error', (error) => {
+          logger.error(`Worker ${threadId} error: ${error.message}`);
+        });
+        
+        worker.on('exit', (code) => {
+          if (code !== 0) {
+            logger.error(`Worker ${threadId} exited with code ${code}`);
+          }
+        });
+      }
+      
+      logger.info('All worker threads started successfully');
+    }
   } catch (error) {
     logger.error(`Fatal error: ${error.message}`);
     process.exit(1);
   }
+}
+
+/**
+ * Distribute wallets evenly among threads
+ * @param {Array} walletIndices Array of wallet indices to distribute
+ * @param {number} numThreads Number of threads to distribute to
+ * @returns {Array} Array of arrays, each containing wallet indices for a thread
+ */
+function distributeWallets(walletIndices, numThreads) {
+  const distribution = Array.from({ length: numThreads }, () => []);
+  
+  for (let i = 0; i < walletIndices.length; i++) {
+    const threadIndex = i % numThreads;
+    distribution[threadIndex].push(walletIndices[i]);
+  }
+  
+  return distribution;
 }
 
 // Handle termination signals
@@ -598,8 +703,10 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
-// Start the application
-main().catch(error => {
-  logger.error(`Error in main execution: ${error.message}`);
-  process.exit(1);
-});
+// Only start the application from the main thread
+if (isMainThread) {
+  main().catch(error => {
+    logger.error(`Error in main execution: ${error.message}`);
+    process.exit(1);
+  });
+}
