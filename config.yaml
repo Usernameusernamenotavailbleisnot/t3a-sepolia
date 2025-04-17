@@ -10,11 +10,14 @@ transaction:
 
 # Swap settings
 swap:
-  minAmount: 0.1  # Minimum amount of TEA to swap
-  maxAmount: 0.2  # Maximum amount of TEA to swap
+  minAmount: 0.2  # Minimum amount of TEA to swap
+  maxAmount: 0.3  # Maximum amount of TEA to swap
 
 # Timing settings
 timeBetweenSwaps: 25  # Hours between swap cycles
 
 # Number of swaps per wallet
-swapsPerWallet: 2  # Number of swaps to perform for each wallet
+swapsPerWallet: 120  # Number of swaps to perform for each wallet
+
+# Thread settings
+threads: 3  # Number of parallel threads for wallet processing
